@@ -29,7 +29,8 @@ How it works (all changes are in overlay 12, the battle engine)
 3. EXP award: participants receive expParticipant only, everybody else
    receives expShare only (vanilla added both for participants holding the item).
 
-Only overlay 12 is modified.  The ROM is rebuilt with ndspy.
+Only overlay 12 is modified.  ndspy is used to read and recompress the overlay;
+the result is written into the original ROM bytes (same size and layout).
 
 Usage
 -----
@@ -39,9 +40,10 @@ Usage
     python hgss_multi_exp.py in.nds --dry-run           # only verify that it is patchable
     python hgss_multi_exp.py in.nds --bps-only          # build only a BPS patch (output/<rom name>.bps)
 
-Supported (checked on real dumps): French, USA, Europe, Australia, German and
-Italian HeartGold / SoulSilver.  Other releases (Spanish, Japanese, Korean...)
-are attempted automatically; the patcher refuses them if the code differs.
+Supported: French, USA, Europe, Australia, German, Italian, Spanish, Japanese
+and Korean HeartGold / SoulSilver (see the README for what was tested).  Other
+releases are attempted automatically; the patcher refuses them if the code
+differs.
 """
 
 from __future__ import annotations
@@ -104,6 +106,9 @@ class Version:
     name: str
     overlay_id: int
     patches: tuple[Patch, ...]
+    # Offset of the code inside overlay 12 relative to the French release
+    # (the Japanese and Korean overlays have a few extra bytes before it).
+    shift: int = 0
 
 
 def _share_block() -> bytes:
@@ -201,6 +206,12 @@ VERSIONS: dict[str, Version] = {
     "IPGE": Version("SoulSilver (USA/Europe/Australia)", 12, _PATCHES),
     "IPGD": Version("SoulSilver (German)", 12, _PATCHES),
     "IPGI": Version("SoulSilver (Italian)", 12, _PATCHES),
+    "IPKS": Version("HeartGold (Spanish)", 12, _PATCHES),
+    "IPGS": Version("SoulSilver (Spanish)", 12, _PATCHES),
+    "IPKJ": Version("HeartGold (Japanese)", 12, _PATCHES, shift=8),
+    "IPGJ": Version("SoulSilver (Japanese)", 12, _PATCHES, shift=8),
+    "IPKK": Version("HeartGold (Korean)", 12, _PATCHES, shift=4),
+    "IPGK": Version("SoulSilver (Korean)", 12, _PATCHES, shift=4),
 }
 
 # ---------------------------------------------------------------------------
@@ -214,7 +225,7 @@ def apply_patches(rom: ndspy.rom.NintendoDSRom, version: Version) -> None:
     data = overlay.data
 
     for patch in version.patches:
-        start = patch.address - OVERLAY_BASE
+        start = patch.address - OVERLAY_BASE + version.shift
         end = start + len(patch.old)
         if not 0 <= start < end <= len(data):
             raise SystemExit(f"{patch.address:#x}: outside overlay {version.overlay_id}")
@@ -231,7 +242,7 @@ def apply_patches(rom: ndspy.rom.NintendoDSRom, version: Version) -> None:
             )
 
     for patch in version.patches:
-        start = patch.address - OVERLAY_BASE
+        start = patch.address - OVERLAY_BASE + version.shift
         new = bytearray(patch.new)
         for lo, hi in patch.wild:  # keep the release's own bytes there
             new[lo:hi] = data[start + lo : start + hi]
@@ -247,6 +258,37 @@ def apply_patches(rom: ndspy.rom.NintendoDSRom, version: Version) -> None:
         new_file += bytes(original_size - len(new_file))
     rom.files[overlay.fileID] = new_file
     rom.arm9OverlayTable = ndspy.code.saveOverlayTable(overlays)
+
+
+def patch_in_place(original: bytes, rom: ndspy.rom.NintendoDSRom, version: Version) -> bytes:
+    """Original ROM with only the patched overlay and its overlay-table entry replaced.
+
+    Rebuilding the whole ROM with ndspy changes the file layout of some
+    releases (e.g. Korean), so the changes are written straight into the
+    original bytes instead: same size, same layout, a minimal diff.
+    """
+    out = bytearray(original)
+    file_id = rom.loadArm9Overlays()[version.overlay_id].fileID
+    fat = int.from_bytes(original[0x48:0x4C], "little")
+    fat_size = int.from_bytes(original[0x4C:0x50], "little")
+    entries = [
+        (int.from_bytes(original[o : o + 4], "little"), int.from_bytes(original[o + 4 : o + 8], "little"))
+        for o in range(fat, fat + fat_size, 8)
+    ]
+    start, end = entries[file_id]
+    # The file may grow into the alignment padding that follows it, up to the next file.
+    limit = min((s for s, _ in entries if s > start), default=len(original))
+    new_file = rom.files[file_id]
+    if start + len(new_file) > limit:
+        raise SystemExit("The patched overlay does not fit before the next file.")
+    out[start : start + len(new_file)] = new_file
+    out[fat + 8 * file_id + 4 : fat + 8 * file_id + 8] = (start + len(new_file)).to_bytes(4, "little")
+    table = int.from_bytes(original[0x50:0x54], "little")
+    table_size = int.from_bytes(original[0x54:0x58], "little")
+    if len(rom.arm9OverlayTable) != table_size:
+        raise SystemExit("The overlay table changed size.")
+    out[table : table + table_size] = rom.arm9OverlayTable
+    return bytes(out)
 
 
 # ---------------------------------------------------------------------------
@@ -379,30 +421,22 @@ def main(argv: list[str] | None = None) -> int:
         print("Dry run: nothing written.")
         return 0
 
+    original = args.rom.read_bytes()
+    patched = patch_in_place(original, rom, version)
+
     if args.bps or args.bps_only:
-        original = args.rom.read_bytes()
-        patched = bytes(rom.save())
-        # ndspy trims the trailing 0xFF padding of dumped ROMs; restore it.
-        pad = bytes([0xFF])
-        if len(patched) < len(original) and not original[len(patched):].strip(pad):
-            patched += pad * (len(original) - len(patched))
-        if len(patched) != len(original):
-            raise SystemExit("The patched ROM has a different size, no patch can be built.")
-
-        if args.bps or args.bps_only:
-            bps = make_bps(original, patched)
-            if apply_bps(original, bps) != patched:
-                raise SystemExit("Internal error: the BPS patch does not reproduce the patched ROM.")
-            bps_path = args.bps_output or Path("output") / f"{args.rom.stem}.bps"
-            bps_path.parent.mkdir(parents=True, exist_ok=True)
-            bps_path.write_bytes(bps)
-            print(f"BPS written: {bps_path} ({len(bps)} bytes)")
-
+        bps = make_bps(original, patched)
+        if apply_bps(original, bps) != patched:
+            raise SystemExit("Internal error: the BPS patch does not reproduce the patched ROM.")
+        bps_path = args.bps_output or Path("output") / f"{args.rom.stem}.bps"
+        bps_path.parent.mkdir(parents=True, exist_ok=True)
+        bps_path.write_bytes(bps)
+        print(f"BPS written: {bps_path} ({len(bps)} bytes)")
         if args.bps_only:
             return 0
 
     output = args.output or args.rom.with_name(f"{args.rom.stem} (Multi EXP){args.rom.suffix}")
-    rom.saveToFile(str(output))
+    output.write_bytes(patched)
     print(f"Written: {output}")
     return 0
 
