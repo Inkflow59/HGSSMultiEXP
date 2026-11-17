@@ -52,3 +52,11 @@ table entry change), so the output has the same size and layout as your dump.
 Only overlay 12 (battle engine) is touched, six small Thumb patches in the two
 EXP routines (split calculation and per-Pokémon award). The Exp. Share item
 itself is left as is; it just no longer changes anything.
+
+## If the patch does not work on a ROM listed as compatible
+
+A ROM marked as compatible can still fail to patch (different dump, header or revision, modified file, tool quirk). If that happens, do not give up. Try one of these instead:
+
+- **Create the patch yourself** from your own ROM, with the tools in this repository.
+- **Build the patched ROM directly** instead of applying a patch file.
+- **Modify the code** to adapt it to your ROM.
