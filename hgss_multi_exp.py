@@ -13,8 +13,8 @@ Behaviour after patching
   an Exp. Share.  Holding the Exp. Share no longer halves their EXP.
 * Every other living, non-egg Pokemon of the party: half of a participant's
   share (Gen 6+ behaviour).  Change NON_PARTICIPANT_SHIFT to alter this:
-      0 -> same as participants (Gen 8 style)
-      1 -> half (default)
+      0 -> same as participants (Gen 8 style, default)
+      1 -> half
       2 -> a quarter, ...
 * Fainted Pokemon, eggs and level 100 Pokemon never gain EXP (vanilla rules).
 
@@ -64,7 +64,7 @@ except ImportError:  # pragma: no cover
 
 # How much EXP a Pokemon that did NOT fight gets, as a right shift of a
 # participant's share: 0 = 100 %, 1 = 50 %, 2 = 25 %.
-NON_PARTICIPANT_SHIFT = 1
+NON_PARTICIPANT_SHIFT = 0
 
 THUMB_NOP = bytes.fromhex("c046")  # mov r8, r8 (ARMv5 has no 'nop' encoding in Thumb)
 

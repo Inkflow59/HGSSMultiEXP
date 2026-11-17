@@ -7,10 +7,10 @@ experience after every battle, without having to hold the Exp. Share
 | Pokémon | EXP gained |
 |---|---|
 | Fought in the battle | normal share (total ÷ number of participants) |
-| Did not fight (alive, not an egg, below level 100) | half of a participant's share |
+| Did not fight (alive, not an egg, below level 100) | same share as a participant |
 
 Change `NON_PARTICIPANT_SHIFT` in `hgss_multi_exp.py` to tune the second row
-(`0` = same as participants, `1` = half, `2` = a quarter…).
+(`0` = same as participants (default), `1` = half, `2` = a quarter…).
 
 ## Usage
 
