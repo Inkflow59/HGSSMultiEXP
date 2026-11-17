@@ -38,6 +38,7 @@ Usage
     python hgss_multi_exp.py in.nds -o out.nds
     python hgss_multi_exp.py in.nds --dry-run           # only verify that it is patchable
     python hgss_multi_exp.py in.nds --ips               # also build an IPS patch (output/<code>.ips)
+    python hgss_multi_exp.py in.nds --bps-only          # build only a BPS patch (output/<rom name>.bps)
     python hgss_multi_exp.py in.nds --ips-only          # build only the IPS patch, no patched ROM
 
 Supported (checked on real dumps): French, USA, Europe, Australia, German and
@@ -49,6 +50,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -321,6 +323,103 @@ def apply_ips(rom: bytes, ips: bytes) -> bytes:
     return bytes(data)
 
 
+def _changed_ranges(original: bytes, patched: bytes, merge_gap: int) -> list[tuple[int, int]]:
+    """Ranges [start, end) where the two buffers differ; close ranges are merged."""
+    size = len(original)
+    block = 1 << 16
+    ranges: list[list[int]] = []
+    i = 0
+    while i < size:
+        while i + block <= size and original[i : i + block] == patched[i : i + block]:
+            i += block
+        if i >= size:
+            break
+        if original[i] == patched[i]:
+            i += 1
+            continue
+        start = i
+        while i < size and original[i] != patched[i]:
+            i += 1
+        if ranges and start - ranges[-1][1] < merge_gap:
+            ranges[-1][1] = i
+        else:
+            ranges.append([start, i])
+    return [(a, b) for a, b in ranges]
+
+
+def _bps_num(value: int) -> bytes:
+    out = bytearray()
+    while True:
+        low = value & 0x7F
+        value >>= 7
+        if value == 0:
+            out.append(0x80 | low)
+            return bytes(out)
+        out.append(low)
+        value -= 1
+
+
+def make_bps(original: bytes, patched: bytes) -> bytes:
+    """Build a BPS patch turning `original` into `patched` (same size)."""
+    if len(original) != len(patched):
+        raise ValueError("ROM size changed, cannot build this BPS patch")
+    size = len(original)
+    out = bytearray(b"BPS1" + _bps_num(size) + _bps_num(size) + _bps_num(0))
+    pos = 0
+    for start, end in _changed_ranges(original, patched, 4):
+        if start > pos:  # SourceRead: copy unchanged bytes from the same offset
+            out += _bps_num(((start - pos - 1) << 2) | 0)
+        out += _bps_num(((end - start - 1) << 2) | 1) + patched[start:end]  # TargetRead
+        pos = end
+    if pos < size:
+        out += _bps_num(((size - pos - 1) << 2) | 0)
+    out += zlib.crc32(original).to_bytes(4, "little")
+    out += zlib.crc32(patched).to_bytes(4, "little")
+    out += zlib.crc32(bytes(out)).to_bytes(4, "little")
+    return bytes(out)
+
+
+def apply_bps(rom: bytes, bps: bytes) -> bytes:
+    """Minimal BPS reader (SourceRead/TargetRead only), used to verify the patch."""
+    if bps[:4] != b"BPS1":
+        raise ValueError("not a BPS file")
+    if zlib.crc32(bps[:-4]) != int.from_bytes(bps[-4:], "little"):
+        raise ValueError("BPS patch checksum mismatch")
+    pos = 4
+
+    def num() -> int:
+        nonlocal pos
+        value, shift = 0, 1
+        while True:
+            byte = bps[pos]
+            pos += 1
+            value += (byte & 0x7F) * shift
+            if byte & 0x80:
+                return value
+            shift <<= 7
+            value += shift
+
+    src_size, dst_size, meta = num(), num(), num()
+    pos += meta
+    if src_size != len(rom):
+        raise ValueError("source size mismatch")
+    out = bytearray()
+    end = len(bps) - 12
+    while pos < end:
+        data = num()
+        length, mode = (data >> 2) + 1, data & 3
+        if mode == 0:
+            out += rom[len(out) : len(out) + length]
+        elif mode == 1:
+            out += bps[pos : pos + length]
+            pos += length
+        else:
+            raise ValueError("unsupported BPS action")
+    if len(out) != dst_size:
+        raise ValueError("target size mismatch")
+    return bytes(out)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Apply the Multi EXP patch to a HGSS ROM.")
     parser.add_argument("rom", type=Path, help="input .nds file")
@@ -328,6 +427,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ips", action="store_true", help="also build an IPS patch")
     parser.add_argument("--ips-only", action="store_true", help="build only the IPS patch (no patched ROM)")
     parser.add_argument("--ips-output", type=Path, help="IPS path (default: output/<game code>.ips)")
+    parser.add_argument("--bps", action="store_true", help="also build a BPS patch")
+    parser.add_argument("--bps-only", action="store_true", help="build only the BPS patch (no patched ROM)")
+    parser.add_argument("--bps-output", type=Path, help="BPS path (default: output/<rom name>.bps)")
     parser.add_argument("--dry-run", action="store_true", help="check the ROM, write nothing")
     args = parser.parse_args(argv)
 
@@ -349,19 +451,35 @@ def main(argv: list[str] | None = None) -> int:
         print("Dry run: nothing written.")
         return 0
 
-    if args.ips or args.ips_only:
+    if args.ips or args.ips_only or args.bps or args.bps_only:
         original = args.rom.read_bytes()
         patched = bytes(rom.save())
+        # ndspy trims the trailing 0xFF padding of dumped ROMs; restore it.
+        pad = bytes([0xFF])
+        if len(patched) < len(original) and not original[len(patched):].strip(pad):
+            patched += pad * (len(original) - len(patched))
         if len(patched) != len(original):
-            raise SystemExit("The patched ROM has a different size, no IPS patch can be built.")
-        ips = make_ips(original, patched)
-        if apply_ips(original, ips) != patched:
-            raise SystemExit("Internal error: the IPS patch does not reproduce the patched ROM.")
-        ips_path = args.ips_output or Path("output") / f"{code}.ips"
-        ips_path.parent.mkdir(parents=True, exist_ok=True)
-        ips_path.write_bytes(ips)
-        print(f"IPS written: {ips_path} ({len(ips)} bytes)")
-        if args.ips_only:
+            raise SystemExit("The patched ROM has a different size, no patch can be built.")
+
+        if args.bps or args.bps_only:
+            bps = make_bps(original, patched)
+            if apply_bps(original, bps) != patched:
+                raise SystemExit("Internal error: the BPS patch does not reproduce the patched ROM.")
+            bps_path = args.bps_output or Path("output") / f"{args.rom.stem}.bps"
+            bps_path.parent.mkdir(parents=True, exist_ok=True)
+            bps_path.write_bytes(bps)
+            print(f"BPS written: {bps_path} ({len(bps)} bytes)")
+
+        if args.ips or args.ips_only:
+            ips = make_ips(original, patched)
+            if apply_ips(original, ips) != patched:
+                raise SystemExit("Internal error: the IPS patch does not reproduce the patched ROM.")
+            ips_path = args.ips_output or Path("output") / f"{code}.ips"
+            ips_path.parent.mkdir(parents=True, exist_ok=True)
+            ips_path.write_bytes(ips)
+            print(f"IPS written: {ips_path} ({len(ips)} bytes)")
+
+        if args.ips_only or args.bps_only:
             return 0
 
     output = args.output or args.rom.with_name(f"{args.rom.stem} (Multi EXP){args.rom.suffix}")
