@@ -37,6 +37,8 @@ Usage
     python hgss_multi_exp.py "HeartGold.nds"            # -> "HeartGold (Multi EXP).nds"
     python hgss_multi_exp.py in.nds -o out.nds
     python hgss_multi_exp.py in.nds --dry-run           # only verify that it is patchable
+    python hgss_multi_exp.py in.nds --ips               # also build an IPS patch (output/<code>.ips)
+    python hgss_multi_exp.py in.nds --ips-only          # build only the IPS patch, no patched ROM
 
 Supported (checked on real dumps): French, USA, Europe, Australia, German and
 Italian HeartGold / SoulSilver.  Other releases (Spanish, Japanese, Korean...)
@@ -235,15 +237,97 @@ def apply_patches(rom: ndspy.rom.NintendoDSRom, version: Version) -> None:
             new[lo:hi] = data[start + lo : start + hi]
         data[start : start + len(new)] = new
 
-    # Store the overlay back (recompressed, as in the original ROM).
-    rom.files[overlay.fileID] = overlay.save(compress=True)
+    # Store the overlay back (recompressed, as in the original ROM).  When it
+    # still fits in its original slot it is zero-padded to the original size,
+    # so that no other file moves: the patched ROM then differs from the
+    # original in a few places only, which is what makes a small IPS possible.
+    original_size = len(rom.files[overlay.fileID])
+    new_file = overlay.save(compress=True)
+    if len(new_file) < original_size:
+        new_file += bytes(original_size - len(new_file))
+    rom.files[overlay.fileID] = new_file
     rom.arm9OverlayTable = ndspy.code.saveOverlayTable(overlays)
+
+
+# ---------------------------------------------------------------------------
+# IPS output
+# ---------------------------------------------------------------------------
+
+IPS_MAX_OFFSET = 0xFFFFFF  # IPS offsets are 24-bit
+IPS_EOF_OFFSET = 0x454F46  # "EOF": a record starting here would end the file
+IPS_MAX_RECORD = 0xFFFF
+IPS_MERGE_GAP = 6  # merge two changes closer than this (a record costs 5 bytes)
+
+
+def make_ips(original: bytes, patched: bytes) -> bytes:
+    """Build an IPS patch turning `original` into `patched` (same size)."""
+    if len(original) != len(patched):
+        raise ValueError("ROM size changed, cannot express it as an IPS patch")
+
+    # 1. Collect the changed ranges [start, end).
+    ranges: list[list[int]] = []
+    size = len(original)
+    i = 0
+    while i < size:
+        if original[i] == patched[i]:
+            i += 1
+            continue
+        start = i
+        while i < size and original[i] != patched[i]:
+            i += 1
+        if ranges and start - ranges[-1][1] < IPS_MERGE_GAP:
+            ranges[-1][1] = i
+        else:
+            ranges.append([start, i])
+
+    # 2. Emit records, split at 64 KiB, dodging the "EOF" offset.
+    out = bytearray(b"PATCH")
+    for start, end in ranges:
+        if end - 1 > IPS_MAX_OFFSET:
+            raise SystemExit(
+                f"Change at {start:#x} is beyond the 16 MiB an IPS patch can address; "
+                "use the patched .nds instead."
+            )
+        while start < end:
+            if start == IPS_EOF_OFFSET:
+                start -= 1  # re-send the previous (unchanged) byte
+            chunk = min(end - start, IPS_MAX_RECORD)
+            out += start.to_bytes(3, "big") + chunk.to_bytes(2, "big") + patched[start : start + chunk]
+            start += chunk
+    out += b"EOF"
+    return bytes(out)
+
+
+def apply_ips(rom: bytes, ips: bytes) -> bytes:
+    """Minimal IPS reader, used to verify the generated patch."""
+    if ips[:5] != b"PATCH":
+        raise ValueError("not an IPS file")
+    data = bytearray(rom)
+    pos = 5
+    while ips[pos : pos + 3] != b"EOF":
+        offset = int.from_bytes(ips[pos : pos + 3], "big")
+        length = int.from_bytes(ips[pos + 3 : pos + 5], "big")
+        pos += 5
+        if length:
+            payload = ips[pos : pos + length]
+            pos += length
+        else:  # RLE record
+            length = int.from_bytes(ips[pos : pos + 2], "big")
+            payload = ips[pos + 2 : pos + 3] * length
+            pos += 3
+        if offset + length > len(data):
+            data.extend(bytes(offset + length - len(data)))
+        data[offset : offset + length] = payload
+    return bytes(data)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Apply the Multi EXP patch to a HGSS ROM.")
     parser.add_argument("rom", type=Path, help="input .nds file")
     parser.add_argument("-o", "--output", type=Path, help="output .nds (default: '<name> (Multi EXP).nds')")
+    parser.add_argument("--ips", action="store_true", help="also build an IPS patch")
+    parser.add_argument("--ips-only", action="store_true", help="build only the IPS patch (no patched ROM)")
+    parser.add_argument("--ips-output", type=Path, help="IPS path (default: output/<game code>.ips)")
     parser.add_argument("--dry-run", action="store_true", help="check the ROM, write nothing")
     args = parser.parse_args(argv)
 
@@ -264,6 +348,21 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         print("Dry run: nothing written.")
         return 0
+
+    if args.ips or args.ips_only:
+        original = args.rom.read_bytes()
+        patched = bytes(rom.save())
+        if len(patched) != len(original):
+            raise SystemExit("The patched ROM has a different size, no IPS patch can be built.")
+        ips = make_ips(original, patched)
+        if apply_ips(original, ips) != patched:
+            raise SystemExit("Internal error: the IPS patch does not reproduce the patched ROM.")
+        ips_path = args.ips_output or Path("output") / f"{code}.ips"
+        ips_path.parent.mkdir(parents=True, exist_ok=True)
+        ips_path.write_bytes(ips)
+        print(f"IPS written: {ips_path} ({len(ips)} bytes)")
+        if args.ips_only:
+            return 0
 
     output = args.output or args.rom.with_name(f"{args.rom.stem} (Multi EXP){args.rom.suffix}")
     rom.saveToFile(str(output))

@@ -19,7 +19,12 @@ pip install ndspy
 python hgss_multi_exp.py "Pokemon HeartGold.nds"
 python hgss_multi_exp.py "Pokemon SoulSilver.nds" -o patched.nds
 python hgss_multi_exp.py rom.nds --dry-run   # only check that the ROM is supported
+python hgss_multi_exp.py rom.nds --ips       # also build output/<game code>.ips
+python hgss_multi_exp.py rom.nds --ips-only  # build only the IPS patch
 ```
+
+IPS patches are built from *your* ROM (diff original → patched, verified by
+re-applying it), so one is generated per release, e.g. `output/IPKF.ips`.
 
 Supported (checked): FR, USA, EU, AU, DE, IT HeartGold and SoulSilver. Other releases are attempted and refused if the code differs.
 
